@@ -129,4 +129,5 @@ app = fastapi.FastAPI(lifespan=lifespan)
 @app.post("/")
 def register_offset(offset: Offset):
     app.state.counter = 0
+    app.state.controllerX.update(offset.x)
     return "well done"
