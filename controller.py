@@ -1,5 +1,5 @@
 # pip3 install fastapi "uvicorn[standard]"
-# uvicorn controller:app --reload
+# uvicorn controller:app --reload --host=0.0.0.0
 
 import asyncio
 import contextlib
@@ -8,6 +8,7 @@ import time
 from pydantic import BaseModel
 import RPi.GPIO as GPIO
 
+GPIO.cleanup()
 GPIO.setwarnings(False)
 GPIO.setmode(GPIO.BOARD)
 
@@ -30,7 +31,8 @@ class Driver:
 
         self.Q = Q
         self.Qb = Qb
-        self.PWM = GPIO.PWM(PWM, 256)
+        self.PWM = GPIO.PWM(PWM, 400)
+        self.PWM.start(0)
         self.offset = offset
 
         self.reset()
@@ -38,26 +40,28 @@ class Driver:
     def reset(self):
         GPIO.output(self.Q, GPIO.LOW)
         GPIO.output(self.Qb, GPIO.LOW)
-        self.PWM.start(0)
+        self.PWM.ChangeDutyCycle(0)
     
     def signal(self, value):
-        intensity = clamp(0, abs(value), 1)
-        intensity = 0 if intensity == 0 else self.offset + (100-self.offset)*intensity*100
+        intensity = clamp(0, abs(value) * 100, 100)
 
+        #print("intensity", intensity, value)
         if value == 0:
             GPIO.output(self.Q, GPIO.LOW)
             GPIO.output(self.Qb, GPIO.LOW)
         elif value < 0:
+            print("GOING RIGHT")
             GPIO.output(self.Q, GPIO.HIGH)
             GPIO.output(self.Qb, GPIO.LOW)
         else:
+            print("GOING LEFT")
             GPIO.output(self.Q, GPIO.LOW)
             GPIO.output(self.Qb, GPIO.HIGH)
-        self.PWM.start(int(intensity))
+        self.PWM.ChangeDutyCycle(int(intensity))
 
 
 class Controller:
-    def __init__(self, driver, Kp = 1.0, Ki = 0.0, Kd = 0.0) -> None:
+    def __init__(self, driver, Kp = 1.0, Ki = 0.0, Kd = 0.0, dead = 1.0) -> None:
         self.Kp = Kp
         self.Ki = Ki
         self.Kd = Kd
@@ -66,6 +70,7 @@ class Controller:
         self.acc_integral = 0
         self.output = 0
         self.driver = driver
+        self.dead = dead
 
     def update(self, error: float):
         now = time.time()
@@ -74,12 +79,13 @@ class Controller:
 
         P = self.Kp * error
         I = self.Ki * self.acc_integral
-        D = self.Kd * (self.prev_error + error) / timedelta
-
+        D = self.Kd * (error-self.prev_error) / timedelta
         U = P + I + D
 
-        if abs(U) < 1:
+        if abs(P) < self.dead:
             self.acc_integral += error * timedelta
+        else:
+            self.acc_integral = 0
 
         self.prev_error = error
         self.driver.signal(U)
@@ -101,19 +107,20 @@ async def set_interval(interval, func, *args, **kwargs):
 @contextlib.asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):
 
-    app.state.driverX = Driver(24, 26, 32, 40)
-    # app.state.driverY = Driver()
+    app.state.driverX = Driver(24, 26, 32, 20)
+    app.state.driverY = Driver(29, 31, 33, 10)
 
-    app.state.controllerX = Controller(app.state.driverX, .6)
-    # app.state.controllerY = Controller()
+    app.state.controllerX = Controller(app.state.driverX, .42, .175, .06, .25)
+    app.state.controllerY = Controller(app.state.driverY, .7, .5, .04, .2)
     
     app.state.counter = 0
 
     def emergency_stop():
-        if app.state.counter:
-            print("EMERGENCY STOP")
+        #print("emergency stopped")
+        if app.state.counter > 0:
+            print("EMERGENCY STOP", time.time())
             app.state.controllerX.reset()
-            # app.state.controllerY.reset()
+            app.state.controllerY.reset()
         app.state.counter += 1
     
     asyncio.create_task(set_interval(.5, emergency_stop))
@@ -121,13 +128,16 @@ async def lifespan(app: fastapi.FastAPI):
     yield
 
     app.state.controllerX.reset()
-    # app.state.controllerY.reset()
+    app.state.controllerY.reset()
+    GPIO.cleanup()
     print("ROBOT OFF!")
 
 app = fastapi.FastAPI(lifespan=lifespan)
 
 @app.post("/")
 def register_offset(offset: Offset):
+    #print("offset:", offset, time.time())
     app.state.counter = 0
     app.state.controllerX.update(offset.x)
+    app.state.controllerY.update(offset.y)
     return "well done"
